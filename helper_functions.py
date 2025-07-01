@@ -2,6 +2,7 @@ import torch as t
 import random
 import numpy as np
 import gymnasium as gym
+import os
 
 def set_global_seeds(seed):
     t.manual_seed(seed)
@@ -10,17 +11,23 @@ def set_global_seeds(seed):
     np.random.seed(seed)
     t.backends.cudnn.deterministic = True
 
-def make_env(env_id, seed, idx, run_name, mode, video_log_freq, video_save_path):
+def make_env(env_id, seed, idx, run_name, mode = "classic-control", video_log_freq = None, video_save_path = None):
     def thunk():
         env = gym.make(env_id, render_mode = "rgb_array")
         env = gym.wrappers.RecordEpisodeStatistics(env)
         
         if idx == 0 and video_log_freq:
+            # Create the full video directory path for this run
+            video_dir = f"{video_save_path}/{run_name}"
+            os.makedirs(video_dir, exist_ok=True)
+            
             env = gym.wrappers.RecordVideo(
                 env, 
-                f"{video_save_path}/{run_name}", 
-                episode_trigger = lambda episode_id: episode_id & video_log_freq == 0,
-                disable_logger = True
+                video_dir,
+                episode_trigger = lambda episode_id: episode_id % video_log_freq == 0,
+                disable_logger = True,
+                video_format = "mp4",
+                force_fps = 30
             )
 
         # if mode == "atari":

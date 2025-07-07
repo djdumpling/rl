@@ -30,11 +30,6 @@ def make_env(env_id, seed, idx, run_name, mode = "classic-control", video_log_fr
                 force_fps = 30
             )
 
-        # if mode == "atari":
-        #     env = prepare_atari_env(env)
-        # elif mode == "mujoco":
-        #     env = prepare_mujoco_env(env)
-
         env.reset(seed = seed)
         env.action_space.seed(seed)
         env.observation_space.seed(seed)

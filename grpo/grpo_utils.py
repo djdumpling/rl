@@ -7,6 +7,9 @@ from typing import Dict, List, Any, Optional
 import numpy as np
 from datasets import load_dataset
 
+FORMAT_REWARD_WEIGHT = 0.15
+CORRECTNESS_REWARD_WEIGHT = 0.85
+
 def load_model(model_name: str) -> torch.nn.Module:
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -84,8 +87,6 @@ class WebInstructDataset(Dataset):
         
         return match_ratio >= 0.3
 
-
-
 def get_dataloader(dataset_name: str, tokenizer, batch_size: int = 2, shuffle: bool = True, dataset_path: Optional[str] = None, max_samples: Optional[int] = None) -> DataLoader:
     if dataset_name.lower() == "webinstruct":
         dataset = WebInstructDataset(tokenizer, max_samples=max_samples)
@@ -101,39 +102,34 @@ def get_dataloader(dataset_name: str, tokenizer, batch_size: int = 2, shuffle: b
             },
             "validator": [item["validator"] for item in x]})
 
-def compute_rewards(model_outputs: torch.Tensor, target_labels: torch.Tensor, reward_model=None) -> torch.Tensor:
-    if reward_model is None:
-        predictions = torch.argmax(model_outputs, dim=-1)
-        rewards = (predictions == target_labels).float()
-        return rewards
+def calculate_logits(llm, full_responses, attention_masks):
+    logits = llm(input_ids = full_responses, attention_masks = attention_masks).logits
+    log_probs = torch.log_softmax(logits, dim = -1)
+
+    selected_log_probs = torch.gather(input = log_probs, dim = 2, index = full_responses.unsqueeze(-1)).squeeze(-1)
+
+    return selected_log_probs
+
+
+
+def calculate_format_reward(response):
+    if (
+        "<answer>" not in response
+        and "</answer>" not in response
+        and "<think>" not in response
+        and "</think>" not in response
+    ):
+        return -1
+    format_reward = 0
+    if "<think>" in response:
+        format_reward += 0.15
+    if "</think>" in response:
+        format_reward += 0.15
+    if "<answer>" in response and "</answer>" in response:
+        return format_reward + 0.7
     else:
-        return reward_model(model_outputs, target_labels)
+        return format_reward
 
-def compute_advantages(rewards: torch.Tensor, values: torch.Tensor, gamma: float = 0.99, gae_lambda: float = 0.95) -> torch.Tensor:
-    advantages = torch.zeros_like(rewards)
-    last_advantage = 0
-    
-    for t in reversed(range(len(rewards))):
-        if t == len(rewards) - 1:
-            next_value = 0
-        else:
-            next_value = values[t + 1]
-        
-        delta = rewards[t] + gamma * next_value - values[t]
-        advantages[t] = delta + gamma * gae_lambda * last_advantage
-        last_advantage = advantages[t]
-    
-    return advantages
 
-def compute_grpo_loss(logits: torch.Tensor, actions: torch.Tensor, advantages: torch.Tensor, old_logits: torch.Tensor, clip_ratio: float = 0.2) -> torch.Tensor:
-
-    log_probs = torch.log_softmax(logits, dim=-1)
-    old_log_probs = torch.log_softmax(old_logits, dim=-1)
-    action_log_probs = log_probs.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
-    old_action_log_probs = old_log_probs.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
-
-    ratio = torch.exp(action_log_probs - old_action_log_probs)
-    clipped_ratio = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio)
-    policy_loss = -torch.min(ratio * advantages, clipped_ratio * advantages).mean()
-    
-    return policy_loss 
+def calculate_rewards(batch_responses, validation_objects):
+    format_rewards = np.array([calculate_format_reward(response) for response in batch_responses])

@@ -7,6 +7,8 @@ from typing import Dict, List, Any, Optional
 import numpy as np
 from datasets import load_dataset
 
+import re
+
 FORMAT_REWARD_WEIGHT = 0.15
 CORRECTNESS_REWARD_WEIGHT = 0.85
 
@@ -110,17 +112,20 @@ def calculate_logits(llm, full_responses, attention_masks):
 
     return selected_log_probs
 
-
+def extract_answer(response):
+    answer = re.search(r"<answer>(.*?)</answer>", response, re.DOTALL)
+    if answer is not None:
+        return answer.group(1).strip()
+    else:
+        return ""
 
 def calculate_format_reward(response):
-    if (
-        "<answer>" not in response
-        and "</answer>" not in response
-        and "<think>" not in response
-        and "</think>" not in response
+    if ( "<answer>" not in response and "</answer>" not in response
+       and "<think>" not in response and "</think>" not in response
     ):
         return -1
     format_reward = 0
+
     if "<think>" in response:
         format_reward += 0.15
     if "</think>" in response:
@@ -129,7 +134,25 @@ def calculate_format_reward(response):
         return format_reward + 0.7
     else:
         return format_reward
+    
+def calculate_correctness_reward(response, validation_object):
+    # Use the built-in validation function from the dataset
+    # This avoids dependency on reasoning_gym
+    extracted_answer = extract_answer(response)
+    if extracted_answer:
+        # Use the validate_function that's already in the validation_object
+        is_correct = validation_object["validate_function"](extracted_answer, validation_object["expected_answer"])
+        return 1.0 if is_correct else 0.0
+    else:
+        return 0.0
 
 
 def calculate_rewards(batch_responses, validation_objects):
-    format_rewards = np.array([calculate_format_reward(response) for response in batch_responses])
+    format_rewards = np.array([calculate_format_reward(response) 
+                               for response in batch_responses])
+    correctness_rewards = np.array([calculate_correctness_reward(extract_answer(response), val_obj)
+                                    for val_obj, response in zip(validation_objects, batch_responses)])
+    
+    rewards = (FORMAT_REWARD_WEIGHT * format_rewards + 
+               CORRECTNESS_REWARD_WEIGHT * correctness_rewards)
+    return rewards

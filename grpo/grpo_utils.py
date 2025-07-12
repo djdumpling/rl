@@ -113,34 +113,91 @@ def calculate_logits(llm, full_responses, attention_masks):
     return selected_log_probs
 
 def extract_answer(response):
+    # regex to extract answer
     answer = re.search(r"<answer>(.*?)</answer>", response, re.DOTALL)
     if answer is not None:
         return answer.group(1).strip()
-    else:
-        return ""
+    
+    response_lower = response.lower()
+    answer_patterns = [
+        r"answer[:\s]+(.*?)(?:\.|$)",
+        r"result[:\s]+(.*?)(?:\.|$)", 
+        r"solution[:\s]+(.*?)(?:\.|$)",
+        r"therefore[,\s]+(.*?)(?:\.|$)",
+        r"thus[,\s]+(.*?)(?:\.|$)",
+        r"hence[,\s]+(.*?)(?:\.|$)"
+    ]
+    
+    for pattern in answer_patterns:
+        match = re.search(pattern, response_lower, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+    
+    sentences = [s.strip() for s in response.split('.') if s.strip()]
+    if sentences:
+        return sentences[-1]
+    
+
+    return response.strip()
 
 def calculate_format_reward(response):
-    if ( "<answer>" not in response and "</answer>" not in response
-       and "<think>" not in response and "</think>" not in response
-    ):
-        return -1
-    format_reward = 0
+    has_think_tags = "<think>" in response and "</think>" in response
+    has_answer_tags = "<answer>" in response and "</answer>" in response
+    
+    # if specific thinking tags
+    if has_think_tags or has_answer_tags:
+        format_reward = 0
+        if "<think>" in response:
+            format_reward += 0.15
+        if "</think>" in response:
+            format_reward += 0.15
+        if has_answer_tags:
+            return format_reward + 0.7
+        else:
+            return format_reward
+    
+    response_lower = response.lower().strip()
+    
+    if not response_lower:
+        return -1.0
+    
+    format_reward = 0.0
+    
+    reasoning_indicators = [
+        "let", "assume", "suppose", "consider", "given", "therefore", "thus", "hence",
+        "because", "since", "if", "then", "else", "however", "but", "although",
+        "first", "second", "third", "finally", "in conclusion", "to solve",
+        "we have", "we get", "we obtain", "we find", "we can", "we need",
+        "the answer is", "the result is", "the solution is"
+    ]
+    
+    reasoning_count = sum(1 for indicator in reasoning_indicators if indicator in response_lower)
+    
+    reasoning_reward = min(0.5, reasoning_count * 0.1)
+    format_reward += reasoning_reward
+    
+    math_indicators = ["=", "+", "-", "*", "/", "(", ")", "[", "]", "{", "}", "∑", "∫", "∞"]
+    math_count = sum(1 for indicator in math_indicators if indicator in response)
+    math_reward = min(0.2, math_count * 0.05)
+    format_reward += math_reward
+    
+    sentences = [s.strip() for s in response.split('.') if s.strip()]
+    if len(sentences) > 1:
+        format_reward += 0.2
 
-    if "<think>" in response:
-        format_reward += 0.15
-    if "</think>" in response:
-        format_reward += 0.15
-    if "<answer>" in response and "</answer>" in response:
-        return format_reward + 0.7
-    else:
-        return format_reward
+    answer_indicators = ["answer:", "result:", "solution:", "therefore", "thus", "hence"]
+    has_answer_section = any(indicator in response_lower for indicator in answer_indicators)
+    if has_answer_section:
+        format_reward += 0.1
+    
+    if format_reward < 0.1 and response_lower:
+        format_reward = 0.1
+    
+    return format_reward
     
 def calculate_correctness_reward(response, validation_object):
-    # Use the built-in validation function from the dataset
-    # This avoids dependency on reasoning_gym
     extracted_answer = extract_answer(response)
     if extracted_answer:
-        # Use the validate_function that's already in the validation_object
         is_correct = validation_object["validate_function"](extracted_answer, validation_object["expected_answer"])
         return 1.0 if is_correct else 0.0
     else:

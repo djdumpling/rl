@@ -14,3 +14,4 @@ jaxtyping
 rich
 transformer_lens
 transformers
+jupyter

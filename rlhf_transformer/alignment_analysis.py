@@ -1,293 +1,203 @@
-"""
-Alignment Analysis Tools for RLHF Training
-
-This module provides tools for:
-1. Saving/loading model checkpoints during training
-2. Analyzing responses across different training phases
-3. Detecting alignment degradation
-4. Comparing model behavior
-"""
-
-import json
-import time
-from pathlib import Path
-from typing import List, Dict, Any, Optional
-
 import torch as t
+import json
+import os
+from pathlib import Path
 import numpy as np
+import wandb
+from transformer_lens import utils
 from rich import print as rprint
 from rich.table import Table
-from rich.console import Console
+import matplotlib.pyplot as plt
+import seaborn as sns
+from typing import List, Tuple, Dict, Any
 
-from rlhf.ipynb import RLHFTrainer, get_samples, reward_fn_sentiment_imdb, RLHFArgs
-
-console = Console()
+from rlhf import RLHFTrainer, RLHFArgs, TransformerWithValueHead
 
 class AlignmentAnalyzer:
-    """Tools for analyzing alignment during RLHF training."""
-    
-    def __init__(self, base_args: RLHFArgs, checkpoint_dir: str):
-        self.base_args = base_args
-        self.checkpoint_dir = Path(checkpoint_dir)
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    def __init__(self, model_path: str, device: str = None):
+        self.device = device or t.device("cuda" if t.cuda.is_available() else "mps" if t.backends.mps.is_available() else "cpu")
+        self.model_path = Path(model_path)
+        self.load_model()
         
-    def save_checkpoint(self, trainer: RLHFTrainer, phase: int, save_responses: bool = True):
-        """Save model weights and optionally responses at a specific phase."""
-        checkpoint_path = self.checkpoint_dir / f"phase_{phase:03d}.pt"
+    def load_model(self):
+        """Load the trained model and its configuration"""
+        if not self.model_path.exists():
+            raise FileNotFoundError(f"❌ Model not found at {self.model_path}")
+            
+        checkpoint = t.load(self.model_path, map_location=self.device)
+        args = checkpoint["args"]
         
-        checkpoint = {
-            'phase': phase,
-            'model_state_dict': trainer.model.state_dict(),
-            'optimizer_state_dict': trainer.optimizer.state_dict(),
-            'scheduler_state_dict': trainer.scheduler.state_dict(),
-            'args': trainer.args,
-            'step': trainer.step,
-        }
+        self.model = TransformerWithValueHead(args.base_model).to(self.device)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.model.eval()
+        print(f"✅ Loaded model from {self.model_path}")
         
-        t.save(checkpoint, checkpoint_path)
-        console.print(f"✅ Checkpoint saved: {checkpoint_path}")
+    def analyze_attention_patterns(self, prompt: str, layer_nums: List[int] = None) -> Dict[str, Any]:
+        """Analyze attention patterns for a given prompt"""
+        self.model.base_model.reset_hooks()
+        attention_patterns = {}
         
-        if save_responses and hasattr(trainer, 'current_responses'):
-            responses_path = self.checkpoint_dir / f"responses_phase_{phase:03d}.json"
-            with open(responses_path, 'w') as f:
-                json.dump(trainer.current_responses, f, indent=2)
-            console.print(f"✅ Responses saved: {responses_path}")
-    
-    def load_checkpoint(self, trainer: RLHFTrainer, phase: int):
-        """Load model weights from a specific phase."""
-        checkpoint_path = self.checkpoint_dir / f"phase_{phase:03d}.pt"
+        def store_attention(attn, hook):
+            attention_patterns[hook.name] = attn.detach().cpu()
         
-        if not checkpoint_path.exists():
-            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        # If no specific layers requested, analyze all layers
+        if layer_nums is None:
+            layer_nums = list(range(self.model.base_model.cfg.n_layers))
+            
+        # Add attention hooks
+        hooks = []
+        for layer in layer_nums:
+            hook_name = f"blocks.{layer}.attn.hook_pattern"
+            hooks.append((hook_name, store_attention))
         
-        checkpoint = t.load(checkpoint_path, map_location=trainer.model.device)
-        trainer.model.load_state_dict(checkpoint['model_state_dict'])
-        trainer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        trainer.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        trainer.step = checkpoint['step']
-        
-        console.print(f"✅ Checkpoint loaded: {checkpoint_path}")
-        return checkpoint
-    
-    def generate_responses_from_checkpoint(self, phase: int, num_samples: int = 10, 
-                                         temperature: float = 1.0) -> Dict[str, Any]:
-        """Generate fresh responses from a saved checkpoint."""
-        # Create a temporary trainer to load the checkpoint
-        temp_trainer = RLHFTrainer(self.base_args)
-        self.load_checkpoint(temp_trainer, phase)
-        temp_trainer.model.eval()
-        
-        with t.inference_mode():
-            sample_ids, samples = get_samples(
-                base_model=temp_trainer.model.base_model,
-                prompt=self.base_args.prefix,
-                batch_size=num_samples,
-                gen_len=self.base_args.gen_len,
-                temperature=temperature,
-                top_k=self.base_args.top_k,
-                prepend_bos=self.base_args.prepend_bos
+        # Run model with hooks
+        with t.no_grad():
+            tokens = self.model.base_model.to_tokens(prompt)
+            self.model.base_model.run_with_hooks(
+                tokens,
+                fwd_hooks=hooks
             )
-            
-            # Get rewards for analysis
-            rewards = self.base_args.reward_fn(samples)
-            
-        temp_trainer.model.train()
         
-        return {
-            'samples': samples,
-            'rewards': rewards.tolist(),
-            'mean_reward': rewards.mean().item(),
-            'phase': phase,
-            'std_reward': rewards.std().item(),
-            'min_reward': rewards.min().item(),
-            'max_reward': rewards.max().item()
-        }
+        return attention_patterns
     
-    def analyze_alignment_degradation(self, phases_to_check: List[int] = [50, 100, 150, 200]) -> Dict[int, Dict]:
-        """Analyze how model responses change across phases."""
-        console.print("\n🔍 [bold blue]Alignment Degradation Analysis[/bold blue]")
-        console.print("=" * 50)
+    def test_edge_cases(self, test_cases: List[str] = None) -> Dict[str, List[float]]:
+        """Test model behavior on edge cases and potential failure modes"""
+        if test_cases is None:
+            test_cases = [
+                "This movie was really terrible but",  # Contradiction setup
+                "This movie was really good except",   # Exception setup
+                "This movie was really ",              # Open-ended
+                "This movie was really really really", # Repetition
+                "This movie was really !!!!!",        # Excessive punctuation
+                "This movie was REALLY",              # All caps
+                "This movie was r3ally",              # Numbers in text
+            ]
         
-        results = {}
-        table = Table(title="Alignment Analysis Results")
-        table.add_column("Phase", style="cyan")
-        table.add_column("Mean Reward", style="green")
-        table.add_column("Std Reward", style="yellow")
-        table.add_column("Min Reward", style="red")
-        table.add_column("Max Reward", style="red")
-        table.add_column("Sample Response", style="white")
+        results = {
+            "prompts": test_cases,
+            "completions": [],
+            "value_estimates": [],
+            "attention_entropy": []
+        }
         
-        for phase in phases_to_check:
-            try:
-                result = self.generate_responses_from_checkpoint(phase, num_samples=5)
-                results[phase] = result
+        for prompt in test_cases:
+            with t.no_grad():
+                tokens = self.model.base_model.to_tokens(prompt)
+                logits, values = self.model(tokens)
                 
-                # Get a sample response (first 80 chars)
-                sample_text = result['samples'][0][:80] + "..." if len(result['samples'][0]) > 80 else result['samples'][0]
-                
-                table.add_row(
-                    str(phase),
-                    f"{result['mean_reward']:.4f}",
-                    f"{result['std_reward']:.4f}",
-                    f"{result['min_reward']:.4f}",
-                    f"{result['max_reward']:.4f}",
-                    sample_text
+                # Get completion
+                completion = self.model.base_model.generate(
+                    tokens,
+                    max_new_tokens=20,
+                    temperature=0.7,
+                    stop_at_eos=False
                 )
+                completion_text = self.model.base_model.to_string(completion[0])
                 
-            except FileNotFoundError:
-                console.print(f"❌ Phase {phase}: Checkpoint not found", style="red")
+                # Get attention patterns and compute entropy
+                attention_patterns = self.analyze_attention_patterns(prompt)
+                avg_entropy = self._compute_attention_entropy(attention_patterns)
+                
+                results["completions"].append(completion_text)
+                results["value_estimates"].append(values.mean().item())
+                results["attention_entropy"].append(avg_entropy)
         
-        console.print(table)
         return results
     
-    def detect_anomalies(self, phases_to_check: List[int], threshold: float = 0.1) -> Dict[str, List]:
-        """Detect anomalous responses that might indicate alignment issues."""
-        console.print("\n🚨 [bold red]Anomaly Detection[/bold red]")
-        console.print("=" * 30)
+    def _compute_attention_entropy(self, attention_patterns: Dict[str, t.Tensor]) -> float:
+        """Compute entropy of attention patterns as a measure of uncertainty"""
+        entropies = []
+        for pattern in attention_patterns.values():
+            # Average over heads and batch
+            pattern = pattern.mean(dim=(0,1))
+            # Compute entropy
+            entropy = -(pattern * t.log(pattern + 1e-10)).sum()
+            entropies.append(entropy.item())
+        return np.mean(entropies)
+    
+    def visualize_attention(self, prompt: str, layer: int = -1, head: int = None):
+        """Visualize attention patterns for a specific layer/head"""
+        attention_patterns = self.analyze_attention_patterns(prompt, [layer])
+        pattern = list(attention_patterns.values())[0]
         
-        anomalies = {
-            'low_reward_samples': [],
-            'high_variance_phases': [],
-            'unusual_responses': []
+        if head is not None:
+            pattern = pattern[:, head:head+1]
+            
+        # Average over batch and heads if needed
+        pattern = pattern.mean(dim=(0,1))
+        
+        # Create visualization
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(pattern.numpy(), cmap='viridis')
+        plt.title(f"Attention Pattern - Layer {layer}" + (f" Head {head}" if head is not None else ""))
+        plt.xlabel("Key Position")
+        plt.ylabel("Query Position")
+        plt.show()
+    
+    def analyze_value_head(self, prompts: List[str]) -> Dict[str, List[float]]:
+        """Analyze value head predictions for different prompts"""
+        results = {
+            "prompts": prompts,
+            "values": [],
+            "value_gradients": []
         }
         
-        for phase in phases_to_check:
-            try:
-                result = self.generate_responses_from_checkpoint(phase, num_samples=10)
-                
-                # Check for low reward samples
-                low_reward_indices = [i for i, r in enumerate(result['rewards']) if r < threshold]
-                if low_reward_indices:
-                    anomalies['low_reward_samples'].extend([
-                        {
-                            'phase': phase,
-                            'sample_idx': i,
-                            'reward': result['rewards'][i],
-                            'text': result['samples'][i]
-                        }
-                        for i in low_reward_indices
-                    ])
-                
-                # Check for high variance phases
-                if result['std_reward'] > 0.3:  # High variance threshold
-                    anomalies['high_variance_phases'].append({
-                        'phase': phase,
-                        'std_reward': result['std_reward'],
-                        'mean_reward': result['mean_reward']
-                    })
-                
-                # Check for unusual responses (very short or very long)
-                for i, sample in enumerate(result['samples']):
-                    if len(sample) < 20 or len(sample) > 200:  # Unusual length
-                        anomalies['unusual_responses'].append({
-                            'phase': phase,
-                            'sample_idx': i,
-                            'length': len(sample),
-                            'text': sample
-                        })
-                        
-            except FileNotFoundError:
-                continue
-        
-        # Report anomalies
-        if anomalies['low_reward_samples']:
-            console.print(f"⚠️  Found {len(anomalies['low_reward_samples'])} low reward samples")
-        if anomalies['high_variance_phases']:
-            console.print(f"⚠️  Found {len(anomalies['high_variance_phases'])} high variance phases")
-        if anomalies['unusual_responses']:
-            console.print(f"⚠️  Found {len(anomalies['unusual_responses'])} unusual responses")
-        
-        return anomalies
-    
-    def compare_phases(self, phase1: int, phase2: int, num_samples: int = 20) -> Dict[str, Any]:
-        """Compare two specific phases in detail."""
-        console.print(f"\n🔄 [bold green]Comparing Phase {phase1} vs Phase {phase2}[/bold green]")
-        console.print("=" * 40)
-        
-        try:
-            result1 = self.generate_responses_from_checkpoint(phase1, num_samples)
-            result2 = self.generate_responses_from_checkpoint(phase2, num_samples)
+        for prompt in prompts:
+            tokens = self.model.base_model.to_tokens(prompt)
+            tokens.requires_grad_(True)
             
-            comparison = {
-                'phase1': result1,
-                'phase2': result2,
-                'reward_change': result2['mean_reward'] - result1['mean_reward'],
-                'variance_change': result2['std_reward'] - result1['std_reward']
-            }
+            _, values = self.model(tokens)
+            mean_value = values.mean()
             
-            table = Table(title=f"Phase {phase1} vs Phase {phase2}")
-            table.add_column("Metric", style="cyan")
-            table.add_column(f"Phase {phase1}", style="blue")
-            table.add_column(f"Phase {phase2}", style="green")
-            table.add_column("Change", style="yellow")
+            # Compute gradient of value with respect to input
+            mean_value.backward()
+            grad_norm = tokens.grad.norm().item()
             
-            table.add_row("Mean Reward", 
-                         f"{result1['mean_reward']:.4f}", 
-                         f"{result2['mean_reward']:.4f}",
-                         f"{comparison['reward_change']:+.4f}")
-            table.add_row("Std Reward", 
-                         f"{result1['std_reward']:.4f}", 
-                         f"{result2['std_reward']:.4f}",
-                         f"{comparison['variance_change']:+.4f}")
+            results["values"].append(mean_value.item())
+            results["value_gradients"].append(grad_norm)
             
-            console.print(table)
+            tokens.requires_grad_(False)
             
-            # Show sample responses
-            console.print(f"\n📝 [bold]Sample from Phase {phase1}:[/bold]")
-            console.print(result1['samples'][0])
-            console.print(f"\n📝 [bold]Sample from Phase {phase2}:[/bold]")
-            console.print(result2['samples'][0])
-            
-            return comparison
-            
-        except FileNotFoundError as e:
-            console.print(f"❌ Error: {e}", style="red")
-            return None
+        return results
 
-def enhanced_training_with_checkpoints(args: RLHFArgs, checkpoint_every: int = 50):
-    """Run training with automatic checkpointing for alignment analysis."""
-    trainer = RLHFTrainer(args)
-    analyzer = AlignmentAnalyzer(args, f"checkpoints/{trainer.run_name}")
+def main():
+    # Example usage
+    analyzer = AlignmentAnalyzer("checkpoints/latest/final_model.pt")
     
-    # Initialize training
-    trainer.step = 0
-    trainer.samples = []
+    # Test edge cases
+    results = analyzer.test_edge_cases()
     
-    import wandb
-    wandb.init(
-        project=args.wandb_project_name,
-        entity=args.wandb_entity,
-        name=trainer.run_name,
-        config=args,
-    )
+    # Print results in a nice format
+    table = Table("Prompt", "Completion", "Value Estimate", "Attention Entropy")
+    for i in range(len(results["prompts"])):
+        table.add_row(
+            results["prompts"][i],
+            results["completions"][i][:50] + "...",
+            f"{results['value_estimates'][i]:.3f}",
+            f"{results['attention_entropy'][i]:.3f}"
+        )
+    rprint(table)
     
-    from tqdm import tqdm
+    # Visualize attention for an interesting case
+    analyzer.visualize_attention("This movie was really terrible but actually good")
     
-    for trainer.phase in tqdm(range(args.total_phases), desc="Training phases"):
-        memory = trainer.rollout_phase()
-        trainer.learning_phase(memory)
-        
-        # Save checkpoint periodically
-        if (trainer.phase + 1) % checkpoint_every == 0:
-            analyzer.save_checkpoint(trainer, trainer.phase + 1, save_responses=True)
+    # Analyze value head behavior
+    value_analysis = analyzer.analyze_value_head([
+        "This movie was really good",
+        "This movie was really bad",
+        "This movie was really terrible but actually amazing",
+        "This movie was really amazing but actually terrible"
+    ])
     
-    # Save final checkpoint
-    analyzer.save_checkpoint(trainer, args.total_phases, save_responses=True)
-    
-    wandb.finish()
-    
-    return trainer, analyzer
+    # Print value analysis
+    table = Table("Prompt", "Value", "Value Gradient")
+    for i in range(len(value_analysis["prompts"])):
+        table.add_row(
+            value_analysis["prompts"][i],
+            f"{value_analysis['values'][i]:.3f}",
+            f"{value_analysis['value_gradients'][i]:.3f}"
+        )
+    rprint(table)
 
-# Example usage
 if __name__ == "__main__":
-    # Example of how to use the alignment analysis tools
-    args = RLHFArgs(reward_fn=reward_fn_sentiment_imdb, total_phases=200)
-    
-    # Run training with checkpoints
-    # trainer, analyzer = enhanced_training_with_checkpoints(args, checkpoint_every=50)
-    
-    # Or analyze existing checkpoints
-    # analyzer = AlignmentAnalyzer(args, "checkpoints/your_run_name")
-    # results = analyzer.analyze_alignment_degradation([50, 100, 150, 200])
-    # anomalies = analyzer.detect_anomalies([50, 100, 150, 200])
-    # comparison = analyzer.compare_phases(50, 200) 
+    main() 

@@ -7,7 +7,6 @@ huggingface_hub
 wandb
 einops
 eindex-callum
-json
 numpy
 tqdm
 tabulate

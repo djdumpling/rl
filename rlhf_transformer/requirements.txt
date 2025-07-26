@@ -15,3 +15,4 @@ rich
 transformer_lens
 transformers
 jupyter
+paramiko

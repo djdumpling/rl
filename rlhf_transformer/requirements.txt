@@ -7,7 +7,6 @@ huggingface_hub
 wandb
 einops
 eindex-callum
-functools
 numpy
 tqdm
 tabulate

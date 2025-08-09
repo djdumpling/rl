@@ -195,8 +195,7 @@ def calculate_format_reward(response):
     
     return format_reward
     
-def calculate_correctness_reward(response, validation_object):
-    extracted_answer = extract_answer(response)
+def calculate_correctness_reward(extracted_answer, validation_object):
     if extracted_answer:
         is_correct = validation_object["validate_function"](extracted_answer, validation_object["expected_answer"])
         return 1.0 if is_correct else 0.0
@@ -207,8 +206,10 @@ def calculate_correctness_reward(response, validation_object):
 def calculate_rewards(batch_responses, validation_objects):
     format_rewards = np.array([calculate_format_reward(response) 
                                for response in batch_responses])
-    correctness_rewards = np.array([calculate_correctness_reward(extract_answer(response), val_obj)
-                                    for val_obj, response in zip(validation_objects, batch_responses)])
+    
+    extracted_answers = [extract_answer(response) for response in batch_responses]
+    correctness_rewards = np.array([calculate_correctness_reward(extracted_answer, val_obj)
+                                    for val_obj, extracted_answer in zip(validation_objects, extracted_answers)])
     
     rewards = (FORMAT_REWARD_WEIGHT * format_rewards + 
                CORRECTNESS_REWARD_WEIGHT * correctness_rewards)
